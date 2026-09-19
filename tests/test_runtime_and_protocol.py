@@ -9,6 +9,9 @@ from aegisrover.protocol.transport import (
 from aegisrover.protocol.auth import ReplayWindow
 from aegisrover.runtime.backpressure import AdmissionController
 from aegisrover.runtime.clock import MonotonicOrder, estimate as estimate_clock
+from aegisrover.runtime.time_sync import (
+    DEGRADED, TRUSTED, UNTRUSTED, ClockTracker,
+)
 from aegisrover.runtime.negotiation import (
     NegotiationError, Offer, Requirement, negotiate,
 )
@@ -166,6 +169,114 @@ def test_monotonic_order_survives_wall_clock_rollback():
     assert [e.kind for e in order.ordered()] == ['boot', 'cmd', 'cmd', 'ack']
     assert order.wall_rollback is True
     assert order.stats()['gaps'] == []
+
+
+# --------------------------------------------------------------------- clock tracking
+def _linear_clock(offset, drift):
+    return lambda t: offset + t * (1 + drift)
+
+
+def test_clock_tracker_detects_drift_and_recalibrates():
+    true_clock = _linear_clock(0.4, 100e-6)
+    pairs = [(t, true_clock(t)) for t in (100.0, 110.0, 120.0, 130.0)]
+    tracker = ClockTracker.calibrate(pairs, tolerance=0.05, window=10)
+    assert tracker.assessment.level == TRUSTED
+
+    # At remote t=150 the robot's oscillator speeds up from 100 to 600 ppm.
+    drifted = lambda t: true_clock(150.0) + (t - 150.0) * (1 + 600e-6)
+    assessment = None
+    for t in range(160, 270, 10):
+        assessment = tracker.observe(float(t), drifted(float(t)))
+    assert assessment.level == UNTRUSTED
+    assert assessment.reason == 'tolerance_exceeded'
+    assert assessment.needs_recalibration
+    assert assessment.error_rate == pytest.approx(500e-6, rel=0.01)
+
+    # Until the recalibration is confirmed, converted stamps are flagged.
+    stamp = tracker.remote_to_local(300.0)
+    assert not stamp.trustworthy and stamp.level == UNTRUSTED
+
+    assert tracker.recalibrate() is True
+    assert tracker.assessment.level == TRUSTED
+    stamp = tracker.remote_to_local(300.0)
+    assert stamp.trustworthy
+    assert stamp.local == pytest.approx(drifted(300.0), abs=0.005)
+    assert tracker.status()['model']['drift_ppm'] == pytest.approx(600, abs=20)
+
+
+def test_clock_tracker_trend_warns_before_tolerance_is_crossed():
+    true_clock = _linear_clock(0.0, 0.0)
+    pairs = [(t, true_clock(t)) for t in (0.0, 10.0, 20.0, 30.0)]
+    tracker = ClockTracker.calibrate(pairs, tolerance=0.05, horizon=120.0)
+    # Error grows 0.5 ms/s: inside tolerance, but the trend crosses it soon.
+    assessment = None
+    for t in (40.0, 50.0, 60.0, 70.0):
+        assessment = tracker.observe(t, true_clock(t) + 0.0005 * (t - 30.0))
+    assert assessment.level == DEGRADED
+    assert assessment.reason == 'trend_exceeds_within_horizon'
+    assert assessment.needs_recalibration
+    assert 0 < assessment.horizon <= 120.0
+    stamp = tracker.remote_to_local(70.0)
+    assert stamp.trustworthy and stamp.level == DEGRADED
+
+
+def test_clock_tracker_marks_stale_projection_untrusted():
+    true_clock = _linear_clock(0.0, 0.0)
+    pairs = [(t, true_clock(t)) for t in (0.0, 10.0, 20.0, 30.0)]
+    tracker = ClockTracker.calibrate(pairs, tolerance=0.05, horizon=10_000.0)
+    for t in (40.0, 50.0, 60.0, 70.0):
+        tracker.observe(t, true_clock(t) + 0.0012 * (t - 30.0))
+    assert tracker.assessment.level != UNTRUSTED  # observed error still inside tolerance
+    # No new samples arrive, but the trend says the error has crossed by t=90.
+    stamp = tracker.remote_to_local(90.0)
+    assert not stamp.trustworthy
+    assert stamp.reason == 'projected_tolerance_exceeded'
+    assert tracker.remote_to_local(75.0).trustworthy
+
+
+def test_clock_tracker_unconfirmable_recalibration_stays_untrusted():
+    true_clock = _linear_clock(0.4, 100e-6)
+    pairs = [(t, true_clock(t)) for t in (100.0, 110.0, 120.0, 130.0)]
+    tracker = ClockTracker.calibrate(pairs, tolerance=0.05)
+    # Sync samples turn wildly noisy (e.g. congested link): the fit must not confirm.
+    for i, t in enumerate(range(200, 280, 10)):
+        noise = 0.2 if i % 2 else -0.2
+        tracker.observe(float(t), true_clock(float(t)) + noise)
+    assert tracker.recalibrate() is False
+    assert tracker.assessment.level == UNTRUSTED
+    assert tracker.assessment.reason == 'recalibration_unconfirmed'
+    assert not tracker.remote_to_local(300.0).trustworthy
+
+
+def test_clock_tracker_uncalibrated_and_insufficient_samples():
+    tracker = ClockTracker(tolerance=0.05)
+    stamp = tracker.remote_to_local(1.0)
+    assert not stamp.trustworthy and stamp.level == UNTRUSTED
+    assert tracker.status()['reason'] == 'uncalibrated'
+    true_clock = _linear_clock(0.1, 0.0)
+    for t in (0.0, 1.0, 2.0):
+        tracker.observe(t, true_clock(t))
+    assert tracker.recalibrate() is False  # fewer than confirm_samples
+    assert tracker.assessment.level == UNTRUSTED
+    tracker.observe(3.0, true_clock(3.0))
+    assert tracker.recalibrate() is True
+    stamp = tracker.remote_to_local(10.0)
+    assert stamp.trustworthy
+    assert stamp.local == pytest.approx(10.1, abs=0.01)
+
+
+def test_clock_tracker_auto_recalibrates_when_enabled():
+    true_clock = _linear_clock(0.4, 100e-6)
+    pairs = [(t, true_clock(t)) for t in (100.0, 110.0, 120.0, 130.0)]
+    tracker = ClockTracker.calibrate(pairs, tolerance=0.05, auto_recalibrate=True)
+    drifted = lambda t: true_clock(150.0) + (t - 150.0) * (1 + 600e-6)
+    for t in range(160, 270, 10):
+        tracker.observe(float(t), drifted(float(t)))
+    status = tracker.status()
+    assert status['level'] == TRUSTED
+    assert status['needs_recalibration'] is False
+    assert status['model']['drift_ppm'] == pytest.approx(600, abs=20)
+    assert tracker.remote_to_local(300.0).trustworthy
 
 
 def test_event_store_replay_and_gaps(repo):
