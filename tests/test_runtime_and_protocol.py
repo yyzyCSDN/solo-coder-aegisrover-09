@@ -8,7 +8,8 @@ from aegisrover.protocol.transport import (
 )
 from aegisrover.protocol.auth import ReplayWindow
 from aegisrover.runtime.backpressure import AdmissionController
-from aegisrover.runtime.clock import MonotonicOrder, estimate as estimate_clock
+from aegisrover.runtime.clock import ClockModel, MonotonicOrder, estimate as estimate_clock
+from aegisrover.runtime.clock_monitor import CALIBRATING, TRUSTED, ClockMonitor
 from aegisrover.runtime.negotiation import (
     NegotiationError, Offer, Requirement, negotiate,
 )
@@ -166,6 +167,89 @@ def test_monotonic_order_survives_wall_clock_rollback():
     assert [e.kind for e in order.ordered()] == ['boot', 'cmd', 'cmd', 'ack']
     assert order.wall_rollback is True
     assert order.stats()['gaps'] == []
+
+
+# ------------------------------------------------------------------ clock monitor
+def test_clock_monitor_flags_recalibration_and_recovers():
+    model = ClockModel(offset=0.4, drift=0.0, reference_remote=0.0)
+    monitor = ClockMonitor(model, tolerance=0.05, predict_horizon=10.0,
+                           trend_window=5, min_trend=3,
+                           min_calibration_samples=4, confirm_rms=0.01)
+    for t in range(1, 6):
+        health = monitor.observe(float(t), t + 0.4)
+    assert health.state == TRUSTED
+    assert health.recalibrate_in is None
+    assert monitor.stamp(5.0).trusted
+
+    def true_local(remote):  # the remote clock picks up an extra 10 ms/s of drift
+        return remote + 0.4 + 0.01 * max(0.0, remote - 5.0)
+
+    for t in range(6, 9):
+        health = monitor.observe(float(t), true_local(t))
+    assert health.state == CALIBRATING  # trend projects a breach: recalibrate now
+    assert not monitor.stamp(8.0).trusted  # unconfirmed mapping is flagged
+
+    for t in range(9, 12):
+        health = monitor.observe(float(t), true_local(t))
+    assert health.state == TRUSTED  # quality gate passed, new model adopted
+    assert health.calibrations == 1
+    stamped = monitor.stamp(20.0)
+    assert stamped.trusted
+    assert stamped.local == pytest.approx(true_local(20.0), abs=0.01)
+
+
+def test_clock_monitor_reports_time_to_breach():
+    model = ClockModel(offset=0.4, drift=0.0, reference_remote=0.0)
+    monitor = ClockMonitor(model, tolerance=0.05, predict_horizon=1.0,
+                           trend_window=3, min_trend=3)
+    for t in range(1, 6):
+        monitor.observe(float(t), t + 0.4)
+    for t in range(6, 9):
+        health = monitor.observe(float(t), t + 0.4 + 0.01 * (t - 5))
+    assert health.state == TRUSTED  # breach is projected but still beyond the horizon
+    assert health.trend == pytest.approx(0.01, abs=0.001)
+    assert health.recalibrate_in == pytest.approx(2.0, abs=0.2)
+
+
+def test_clock_monitor_stable_clock_stays_trusted():
+    model = ClockModel(offset=0.25, drift=0.0, reference_remote=0.0)
+    monitor = ClockMonitor(model, tolerance=0.05, predict_horizon=30.0)
+    for i in range(20):
+        noise = 0.001 if i % 2 else -0.001
+        health = monitor.observe(float(i), i + 0.25 + noise)
+    assert health.state == TRUSTED
+    assert health.recalibrate_in is None or health.recalibrate_in > 300  # nothing actionable
+    assert health.uncertainty <= 0.001 + 1e-9
+    assert monitor.stamp(100.0).trusted
+
+
+def test_clock_monitor_clock_step_triggers_immediate_recalibration():
+    model = ClockModel(offset=0.1, drift=0.0, reference_remote=0.0)
+    monitor = ClockMonitor(model, tolerance=0.05, min_calibration_samples=4,
+                           confirm_rms=0.01)
+    for t in range(1, 4):
+        monitor.observe(float(t), t + 0.1)
+    health = monitor.observe(4.0, 4.0 + 1.1)  # remote clock stepped by a second
+    assert health.state == CALIBRATING
+    assert not monitor.stamp(4.0).trusted
+    for t in range(5, 8):
+        health = monitor.observe(float(t), t + 1.1)
+    assert health.state == TRUSTED
+    assert monitor.stamp(20.0).local == pytest.approx(21.1, abs=0.01)
+
+
+def test_clock_monitor_noisy_link_stays_untrusted():
+    model = ClockModel(offset=0.0, drift=0.0, reference_remote=0.0)
+    monitor = ClockMonitor(model, tolerance=0.05, min_calibration_samples=4,
+                           calibration_window=6, confirm_rms=0.01)
+    monitor.begin_calibration()
+    assert not monitor.stamp(1.0).trusted
+    for i in range(6):
+        noise = 0.05 if i % 2 else -0.05
+        health = monitor.observe(float(i), i + noise)
+    assert health.state == CALIBRATING  # rms 0.05 > confirm_rms: refuse to confirm
+    assert health.pending == 6
+    assert not monitor.stamp(10.0).trusted
 
 
 def test_event_store_replay_and_gaps(repo):
